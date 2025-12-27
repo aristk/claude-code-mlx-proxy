@@ -1,6 +1,8 @@
 # Local MLX Backend for Claude Code
 
-This project provides a local server that acts as a backend for the **Claude Code** command line coding assistant. It allows you to use open-source models running on your local machine via Apple's MLX framework. Instead of sending your code to Anthropic's servers, you can use powerful models like Llama 3, GLM-4.5-Air, DeepSeek, and more, all running on your Apple Silicon Mac.
+This project provides a local server that acts as a backend for the **Claude Code** command line coding assistant. It allows you to use open-source models running on your local machine via Apple's MLX framework. Instead of sending your code to Anthropic's servers, you can use powerful models like Llama 3, GLM-4.5-Air, DeepSeek R1, and more, all running on your Apple Silicon Mac.
+
+**New:** Supports reasoning models like DeepSeek R1 with thinking/reasoning output!
 
 This server implements the Claude Messages API format that Claude Code communicates with, redirecting all requests to a local model of your choice.
 
@@ -79,7 +81,7 @@ Before configuring Claude Code, you can verify the server is working correctly b
 curl -X POST http://localhost:8888/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-4-sonnet-20250514",
+    "model": "claude-sonnet-4-5-20250929",
     "max_tokens": 100,
     "messages": [
       {"role": "user", "content": "Explain what MLX is in one sentence."}
@@ -100,7 +102,7 @@ This will return a Claude-style response:
       "text": "MLX is Apple's machine learning framework optimized for efficient training and inference on Apple Silicon chips."
     }
   ],
-  "model": "claude-4-sonnet-20250514",
+  "model": "claude-sonnet-4-5-20250929",
   "stop_reason": "end_turn",
   "stop_sequence": null,
   "usage": {
@@ -115,10 +117,10 @@ This will return a Claude-style response:
 You can also test the token counting endpoint:
 
 ```bash
-curl -X POST http://localhost:8000/v1/messages/count_tokens \
+curl -X POST http://localhost:8888/v1/messages/count_tokens \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-4-sonnet-20250514",
+    "model": "claude-sonnet-4-5-20250929",
     "messages": [
       {"role": "user", "content": "Explain what MLX is in one sentence."}
     ]
@@ -141,7 +143,7 @@ The server also supports streaming responses using Server-Sent Events (SSE), jus
 curl -X POST http://localhost:8888/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-4-sonnet-20250514",
+    "model": "claude-sonnet-4-5-20250929",
     "max_tokens": 100,
     "messages": [
       {"role": "user", "content": "Explain what MLX is in one sentence."}
@@ -161,6 +163,37 @@ The server implements the following Claude-compatible endpoints:
 - `GET /` - Root endpoint with server status
 - `GET /health` - Health check endpoint
 
+## Reasoning Model Support
+
+The server now supports reasoning models like DeepSeek R1 that output their thought process. When enabled, the server:
+
+- Extracts `<think>...</think>` blocks from model output
+- Returns thinking content as separate `ContentBlockThinking` blocks
+- Supports both streaming and non-streaming modes
+- Automatically strips EOS tokens configured in `.env`
+
+To enable thinking mode in your requests, include the `thinking` parameter:
+
+```json
+{
+  "model": "claude-sonnet-4-5-20250929",
+  "messages": [...],
+  "thinking": {
+    "type": "enabled",
+    "budget_tokens": 10000
+  }
+}
+```
+
+**Note:** Thinking blocks are excluded from conversation context to prevent the model from seeing its own reasoning in subsequent turns.
+
+## Performance: DeepSeek R1 7B 4-bit on M1 16GB
+
+- **Speed**: ~20-25 tokens/second
+- **Memory**: ~5GB during inference
+- **Model Size**: ~4GB on disk
+- **First Load**: 2-3 minutes (cached afterward)
+
 ## Configuration (`.env`)
 
 All server settings are managed through the `.env` file.
@@ -169,14 +202,14 @@ All server settings are managed through the `.env` file.
 | --------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | `HOST`                | `0.0.0.0`                                     | The host address for the server.                                                                        |
 | `PORT`                | `8888`                                        | The port for the server.                                                                                |
-| `MODEL_NAME`          | `mlx-community/GLM-4.5-Air-3bit`              | The MLX model to load from Hugging Face. Find more at the [MLX Community](https://huggingface.co/mlx-community). |
-| `API_MODEL_NAME`      | `claude-4-sonnet-20250514`                    | The model name that the API will report. Set this to a known Claude model to ensure client compatibility. |
+| `MODEL_NAME`          | `/tmp/deepseek-r1-7b-4bit`                    | The MLX model to load - can be a local path or Hugging Face model ID (e.g., `mlx-community/GLM-4.5-Air-3bit`). |
+| `API_MODEL_NAME`      | `claude-sonnet-4-5-20250929`                  | The model name that the API will report. Set this to a known Claude model to ensure client compatibility. |
 | `TRUST_REMOTE_CODE`   | `false`                                       | Set to `true` if the model tokenizer requires trusting remote code.                                     |
-| `EOS_TOKEN`           | `None`                                        | The End-of-Sequence token, required for some models like Qwen.               |
+| `EOS_TOKEN`           | `<\|im_end\|>`                                  | The End-of-Sequence token to strip from output. Required for DeepSeek R1, Qwen, and similar models.    |
 | `DEFAULT_MAX_TOKENS`  | `4096`                                        | The default maximum number of tokens to generate in a response.                                         |
 | `DEFAULT_TEMPERATURE` | `1.0`                                         | The default temperature for generation (creativity).                                                    |
 | `DEFAULT_TOP_P`       | `1.0`                                         | The default top-p for generation.                                                                       |
-| `VERBOSE`             | `false`                                       | Set to `true` to enable verbose logging from the MLX generate function.                                 |
+| `VERBOSE`             | `true`                                        | Set to `true` to enable verbose logging from the MLX generate function.                                 |
 
 ## License
 
