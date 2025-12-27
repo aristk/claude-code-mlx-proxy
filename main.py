@@ -1,4 +1,5 @@
 import json
+import re
 from typing import List, Dict, Any, Optional, Union, Literal
 from contextlib import asynccontextmanager
 
@@ -18,6 +19,11 @@ tokenizer = None
 class ContentBlockText(BaseModel):
     type: Literal["text"] = "text"
     text: str
+
+
+class ContentBlockThinking(BaseModel):
+    type: Literal["thinking"] = "thinking"
+    thinking: str
 
 
 class ContentBlockImage(BaseModel):
@@ -44,7 +50,9 @@ class SystemContent(BaseModel):
 
 
 class ThinkingConfig(BaseModel):
-    enabled: bool
+    type: Optional[str] = None
+    enabled: Optional[bool] = None
+    budget_tokens: Optional[int] = None
 
 
 class Tool(BaseModel):
@@ -60,6 +68,7 @@ class Message(BaseModel):
         List[
             Union[
                 ContentBlockText,
+                ContentBlockThinking,
                 ContentBlockImage,
                 ContentBlockToolUse,
                 ContentBlockToolResult,
@@ -104,11 +113,33 @@ class MessageResponse(BaseModel):
     id: str
     type: str = "message"
     role: str = "assistant"
-    content: List[ContentBlockText]
+    content: List[Union[ContentBlockThinking, ContentBlockText]]
     model: str
     stop_reason: str = "end_turn"
     stop_sequence: Optional[str] = None
     usage: Usage
+
+
+def extract_thinking(text: str) -> tuple[Optional[str], str]:
+    """Extract <think>...</think> content from response.
+    Returns (thinking_content, remaining_text)
+    Handles cases where <think> tag might be consumed by tokenizer."""
+    # Try full pattern first
+    pattern = r'<think>(.*?)</think>'
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        thinking = match.group(1).strip()
+        remaining = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+        return thinking, remaining
+
+    # Handle case where only </think> is present (opening tag consumed by tokenizer)
+    if '</think>' in text:
+        parts = text.split('</think>', 1)
+        thinking = parts[0].strip()
+        remaining = parts[1].strip() if len(parts) > 1 else ""
+        return thinking, remaining
+
+    return None, text
 
 
 class MessageStreamResponse(BaseModel):
@@ -147,6 +178,7 @@ def extract_text_from_content(
         List[
             Union[
                 ContentBlockText,
+                ContentBlockThinking,
                 ContentBlockImage,
                 ContentBlockToolUse,
                 ContentBlockToolResult,
@@ -154,12 +186,19 @@ def extract_text_from_content(
         ],
     ],
 ) -> str:
-    """Extract text content from Claude-style content blocks"""
+    """Extract text content from Claude-style content blocks.
+    Skips thinking blocks - we don't include previous thinking in prompts."""
     if isinstance(content, str):
         return content
 
     text_parts = []
     for block in content:
+        # Skip thinking blocks
+        if hasattr(block, "type") and block.type == "thinking":
+            continue
+        elif isinstance(block, dict) and block.get("type") == "thinking":
+            continue
+        # Extract text blocks
         if hasattr(block, "type") and block.type == "text":
             text_parts.append(block.text)
         elif isinstance(block, dict) and block.get("type") == "text":
@@ -317,13 +356,30 @@ async def generate_response(request: MessagesRequest, prompt: str, input_tokens:
         verbose=config.VERBOSE,
     )
 
+    # Strip EOS token if configured
+    if config.EOS_TOKEN and config.EOS_TOKEN in response_text:
+        response_text = response_text.replace(config.EOS_TOKEN, "").strip()
+
+    # Extract thinking if present and thinking is enabled
+    content_blocks = []
+    thinking_enabled = request.thinking and (
+        request.thinking.enabled or request.thinking.budget_tokens
+    )
+
+    if thinking_enabled:
+        thinking_content, response_text = extract_thinking(response_text)
+        if thinking_content:
+            content_blocks.append(ContentBlockThinking(thinking=thinking_content))
+
+    content_blocks.append(ContentBlockText(text=response_text))
+
     # Count output tokens
     output_tokens = count_tokens(response_text)
 
     # Create Claude-style response
     response = MessageResponse(
         id="msg_" + str(abs(hash(prompt)))[:8],
-        content=[ContentBlockText(text=response_text)],
+        content=content_blocks,
         model=request.model,
         usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
     )
@@ -334,9 +390,12 @@ async def generate_response(request: MessagesRequest, prompt: str, input_tokens:
 async def stream_generate_response(
     request: MessagesRequest, prompt: str, input_tokens: int
 ):
-    """Generate streaming response"""
+    """Generate streaming response with thinking support"""
     response_id = "msg_" + str(abs(hash(prompt)))[:8]
     full_text = ""
+    thinking_enabled = request.thinking and (
+        request.thinking.enabled or request.thinking.budget_tokens
+    )
 
     # Send message start event
     message_start = {
@@ -354,39 +413,68 @@ async def stream_generate_response(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    # Send content block start
-    content_start = {
+    block_index = 0
+
+    # Collect all tokens first for thinking parsing
+    for response in stream_generate(
+        model,
+        tokenizer,
+        prompt=prompt,
+        max_tokens=request.max_tokens,
+    ):
+        text = response.text
+        if config.EOS_TOKEN and config.EOS_TOKEN in text:
+            text = text.replace(config.EOS_TOKEN, "")
+            if not text:
+                continue
+        full_text += text
+
+    # Parse thinking and text
+    if thinking_enabled:
+        thinking_content, text_content = extract_thinking(full_text)
+    else:
+        thinking_content, text_content = None, full_text
+
+    # Stream thinking block if present
+    if thinking_content:
+        thinking_start = {
+            "type": "content_block_start",
+            "index": block_index,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }
+        yield f"event: content_block_start\ndata: {json.dumps(thinking_start)}\n\n"
+
+        thinking_delta = {
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {"type": "thinking_delta", "thinking": thinking_content},
+        }
+        yield f"event: content_block_delta\ndata: {json.dumps(thinking_delta)}\n\n"
+
+        thinking_stop = {"type": "content_block_stop", "index": block_index}
+        yield f"event: content_block_stop\ndata: {json.dumps(thinking_stop)}\n\n"
+        block_index += 1
+
+    # Stream text block
+    text_start = {
         "type": "content_block_start",
-        "index": 0,
+        "index": block_index,
         "content_block": {"type": "text", "text": ""},
     }
-    yield f"event: content_block_start\ndata: {json.dumps(content_start)}\n\n"
+    yield f"event: content_block_start\ndata: {json.dumps(text_start)}\n\n"
 
-    # Stream generation
-    for i, response in enumerate(
-        stream_generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=request.max_tokens,
-        )
-    ):
-        full_text += response.text
+    text_delta = {
+        "type": "content_block_delta",
+        "index": block_index,
+        "delta": {"type": "text_delta", "text": text_content},
+    }
+    yield f"event: content_block_delta\ndata: {json.dumps(text_delta)}\n\n"
 
-        # Send content block delta
-        content_delta = {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": response.text},
-        }
-        yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
+    text_stop = {"type": "content_block_stop", "index": block_index}
+    yield f"event: content_block_stop\ndata: {json.dumps(text_stop)}\n\n"
 
     # Count output tokens
     output_tokens = count_tokens(full_text)
-
-    # Send content block stop
-    content_stop = {"type": "content_block_stop", "index": 0}
-    yield f"event: content_block_stop\ndata: {json.dumps(content_stop)}\n\n"
 
     # Send message delta with usage
     message_delta = {
