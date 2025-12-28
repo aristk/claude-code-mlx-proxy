@@ -1,5 +1,8 @@
 import json
 import re
+import signal
+import sys
+import asyncio
 from typing import List, Dict, Any, Optional, Union, Literal
 from contextlib import asynccontextmanager
 
@@ -164,9 +167,12 @@ async def lifespan(app: FastAPI):
 
     model, tokenizer = load(config.MODEL_NAME, tokenizer_config=tokenizer_config)
     print("Model loaded successfully!")
-    yield
-    # Cleanup on shutdown
-    print("Shutting down...")
+
+    try:
+        yield
+    finally:
+        # Cleanup on shutdown
+        print("Shutting down...")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -362,8 +368,10 @@ async def generate_response(request: MessagesRequest, prompt: str, input_tokens:
 
     # Extract thinking if present and thinking is enabled
     content_blocks = []
-    thinking_enabled = request.thinking and (
-        request.thinking.enabled or request.thinking.budget_tokens
+    thinking_enabled = (
+        not config.DISABLE_THINKING
+        and request.thinking
+        and (request.thinking.enabled or request.thinking.budget_tokens)
     )
 
     if thinking_enabled:
@@ -393,8 +401,10 @@ async def stream_generate_response(
     """Generate streaming response with thinking support"""
     response_id = "msg_" + str(abs(hash(prompt)))[:8]
     full_text = ""
-    thinking_enabled = request.thinking and (
-        request.thinking.enabled or request.thinking.budget_tokens
+    thinking_enabled = (
+        not config.DISABLE_THINKING
+        and request.thinking
+        and (request.thinking.enabled or request.thinking.budget_tokens)
     )
 
     # Send message start event
@@ -503,6 +513,30 @@ async def root():
     }
 
 
+async def serve():
+    """Run the server with proper shutdown handling"""
+    server_config = uvicorn.Config(
+        app,
+        host=config.HOST,
+        port=config.PORT,
+        log_level="info",
+    )
+    server = uvicorn.Server(server_config)
+
+    # Install signal handlers
+    def handle_exit(sig, frame):
+        asyncio.create_task(server.shutdown())
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    await server.serve()
+
+
 if __name__ == "__main__":
     print(f"Starting Claude Code MLX Proxy on {config.HOST}:{config.PORT}")
-    uvicorn.run(app, host=config.HOST, port=config.PORT)
+    try:
+        asyncio.run(serve())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    print("\nServer stopped")

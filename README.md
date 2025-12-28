@@ -210,6 +210,7 @@ All server settings are managed through the `.env` file.
 | `DEFAULT_TEMPERATURE` | `1.0`                                         | The default temperature for generation (creativity).                                                    |
 | `DEFAULT_TOP_P`       | `1.0`                                         | The default top-p for generation.                                                                       |
 | `VERBOSE`             | `true`                                        | Set to `true` to enable verbose logging from the MLX generate function.                                 |
+| `DISABLE_THINKING`    | `false`                                       | Set to `true` to disable thinking mode support (prevents extraction of `<think>` blocks).              |
 
 ## License
 

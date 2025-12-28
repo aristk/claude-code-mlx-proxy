@@ -28,5 +28,8 @@ class Config:
     # Logging
     VERBOSE: bool = os.getenv("VERBOSE", "false").lower() == "true"
 
+    # Thinking/reasoning
+    DISABLE_THINKING: bool = os.getenv("DISABLE_THINKING", "false").lower() == "true"
+
 
 config = Config()
